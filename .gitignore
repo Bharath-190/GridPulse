@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Local datasets
+data/raw/*
+!data/raw/.gitkeep
+
+data/bronze/*
+!data/bronze/.gitkeep
+
+data/silver/*
+!data/silver/.gitkeep
+
+data/gold/*
+!data/gold/.gitkeep
+
+data/synthetic/*
+!data/synthetic/.gitkeep
+
+# Temporary files
+*.log
+.DS_Store
+
+# Downloaded third-party datasets
+data/external/

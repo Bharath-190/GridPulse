@@ -1,0 +1,36 @@
+project:
+  name: GridPulse
+  version: 0.1.0
+  domain: solar_pv_operations
+  timezone_storage: UTC
+  primary_source: upb-nlp/PV-Generation-Dataset
+  synthetic_data_policy: segregated_and_labelled
+
+primary_dataset:
+  repository: https://github.com/upb-nlp/PV-Generation-Dataset
+  license: CC-BY-4.0
+  sites:
+    - site_id: SITE_A
+      folder: site_a
+      coverage_start: '2025-01-04'
+      coverage_end: '2026-06-30'
+      nominal_inverter_capacity_kw: 50
+      capacity_basis: inverter_nominal_ac_rating
+    - site_id: SITE_B
+      folder: site_b
+      coverage_start: '2025-05-01'
+      coverage_end: '2026-05-31'
+      nominal_inverter_capacity_kw: 50
+      capacity_basis: inverter_nominal_ac_rating
+
+quality:
+  expected_source_interval: 5 minutes
+  retain_nighttime_zero_power: true
+  daylight_saving_gaps_are_missing: true
+  preserve_source_files: true
+  quarantine_invalid_rows: true
+
+synthetic_data:
+  enabled: true
+  record_origin: synthetic
+  scenario_version: '0.1.0'
