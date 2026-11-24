@@ -1,0 +1,560 @@
+#!/usr/bin/env python3
+"""Build GridPulse Silver Delta tables from the validated Bronze layer.
+
+Silver is a deterministic full refresh from the current Bronze snapshots. It
+preserves source measurements and NULLs, adds auditable quality flags, and
+creates a coverage-aware hourly view that compares publisher hourly values to
+aggregates of the five-minute inverter readings.
+"""
+import sys
+sys.path.insert(0, str(Path.cwd() / "scripts"))
+
+from __future__ import annotations
+
+import logging
+from pathlib import Path
+
+from delta import configure_spark_with_delta_pip
+from pyspark.sql import DataFrame, SparkSession, functions as F
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+BRONZE_ROOT = PROJECT_ROOT / "data" / "bronze" / "delta"
+SILVER_ROOT = PROJECT_ROOT / "data" / "silver" / "delta"
+
+BRONZE_INVERTER = BRONZE_ROOT / "bronze_inverter_telemetry_5m"
+BRONZE_HOURLY = BRONZE_ROOT / "bronze_site_hourly_weather"
+
+SILVER_INVERTER = SILVER_ROOT / "silver_inverter_telemetry_5m"
+SILVER_HOURLY = SILVER_ROOT / "silver_site_hourly_conditions"
+SILVER_PERFORMANCE = SILVER_ROOT / "silver_site_hourly_performance"
+
+INVERTER_MEASUREMENTS = [
+    "active_power_kw",
+    "dc_input_power_kw",
+    "daily_energy_kwh",
+    "cumulative_energy_kwh",
+    "inverter_temp_c",
+    "grid_freq_hz",
+    "power_factor",
+    "efficiency_pct",
+]
+
+HOURLY_COLUMNS = [
+    "datetime_utc", "datetime_local", "active_power_kw",
+    "dc_input_power_kw", "daily_energy_kwh", "cumulative_energy_kwh",
+    "inverter_temp_c", "grid_freq_hz", "power_factor", "efficiency_pct",
+    "inverter_status", "is_generating", "temp_c", "humidity_pct",
+    "cloud_cover_pct", "wind_speed_kmh", "ghi_wm2", "dni_wm2",
+    "dhi_wm2", "precip_mm", "solar_elevation_deg", "solar_azimuth_deg",
+    "capacity_factor",
+]
+
+HOURLY_NUMERIC_COLUMNS = [
+    name for name in HOURLY_COLUMNS
+    if name not in {"datetime_utc", "datetime_local", "inverter_status"}
+]
+
+# Reconciliation thresholds are used only to flag cross-source disagreement.
+# They do not change or discard either source's measurements.
+RAW_GENERATION_CONFLICT_THRESHOLD_KW = 1.0
+DAYLIGHT_SOLAR_ELEVATION_THRESHOLD_DEG = 5.0
+DAYLIGHT_GHI_THRESHOLD_WM2 = 100.0
+
+# Operational telemetry fields used to assess whether the publisher's inverter
+# telemetry is populated. Active power is intentionally excluded from this
+# null count because it is evaluated separately.
+PUBLISHER_OPERATIONAL_FIELDS = [
+    "publisher_hourly_dc_input_power_kw",
+    "publisher_daily_energy_kwh",
+    "publisher_cumulative_energy_kwh",
+    "publisher_hourly_inverter_temp_c",
+    "publisher_hourly_grid_freq_hz",
+    "publisher_hourly_power_factor",
+    "publisher_hourly_efficiency_pct",
+    "publisher_inverter_status",
+]
+
+# Bounds here are only used to flag suspicious values. They never filter or
+# rewrite observations. Temperature and wind speed are deliberately not given
+# fixed bounds because those depend on site and sensor context.
+RANGE_CHECKS = {
+    "humidity_pct": (0.0, 100.0),
+    "cloud_cover_pct": (0.0, 100.0),
+    "ghi_wm2": (0.0, None),
+    "dni_wm2": (0.0, None),
+    "dhi_wm2": (0.0, None),
+    "precip_mm": (0.0, None),
+    "capacity_factor": (0.0, 1.0),
+    "efficiency_pct": (0.0, 100.0),
+    "power_factor": (-1.0, 1.0),
+    "is_generating": (0.0, 1.0),
+}
+
+
+def _require_columns(frame: DataFrame, required: list[str], label: str) -> None:
+    missing = sorted(set(required) - set(frame.columns))
+    if missing:
+        raise ValueError(f"{label} is missing required columns: {missing}")
+
+
+def _null_count_expr(columns: list[str], alias: str) -> F.Column:
+    terms = [F.when(F.col(name).isNull(), F.lit(1)).otherwise(F.lit(0)) for name in columns]
+    return sum(terms, F.lit(0)).cast("int").alias(alias)
+
+
+def _trim_nullable_string(frame: DataFrame, name: str) -> DataFrame:
+    if name not in frame.columns:
+        return frame
+    value = F.trim(F.col(name))
+    return frame.withColumn(name, F.when(value == "", F.lit(None).cast("string")).otherwise(value))
+
+
+def build_silver_inverter(bronze: DataFrame) -> DataFrame:
+    """Normalize five-minute inverter rows and add non-destructive quality flags."""
+    required = ["site_id", "device_name", "event_ts_utc", *INVERTER_MEASUREMENTS]
+    _require_columns(bronze, required, "Bronze inverter telemetry")
+
+    result = bronze
+    for name in ("site_id", "site_name", "installer", "device_name", "inverter_status"):
+        result = _trim_nullable_string(result, name)
+    for name in INVERTER_MEASUREMENTS:
+        result = result.withColumn(name, F.col(name).cast("double"))
+
+    result = result.withColumn("event_ts_utc", F.col("event_ts_utc").cast("timestamp"))
+    result = result.withColumn("event_date_utc", F.to_date("event_ts_utc"))
+    result = result.withColumn("event_hour_utc", F.date_trunc("hour", F.col("event_ts_utc")))
+    result = result.withColumn(
+        "measurement_null_count",
+        _null_count_expr(INVERTER_MEASUREMENTS, "measurement_null_count"),
+    )
+    result = result.withColumn(
+        "measurement_completeness_pct",
+        F.round(
+            (F.lit(len(INVERTER_MEASUREMENTS)) - F.col("measurement_null_count"))
+            / F.lit(len(INVERTER_MEASUREMENTS)) * F.lit(100.0),
+            2,
+        ),
+    )
+    result = result.withColumn(
+        "active_power_negative_flag",
+        F.when(F.col("active_power_kw") < 0, F.lit(True)).otherwise(F.lit(False)),
+    )
+    result = result.withColumn(
+        "data_quality_status",
+        F.when(F.col("active_power_negative_flag"), F.lit("review"))
+        .when(F.col("measurement_null_count") > 0, F.lit("partial"))
+        .otherwise(F.lit("complete")),
+    )
+    return result
+
+
+def build_silver_hourly_conditions(bronze: DataFrame) -> DataFrame:
+    """Normalize publisher hourly rows while retaining all original measures."""
+    _require_columns(bronze, ["site_id", "event_ts_utc", *HOURLY_COLUMNS], "Bronze hourly data")
+    result = bronze
+    for name in ("site_id", "datetime_utc", "datetime_local", "inverter_status"):
+        result = _trim_nullable_string(result, name)
+    for name in HOURLY_NUMERIC_COLUMNS:
+        result = result.withColumn(name, F.col(name).cast("double"))
+
+    result = result.withColumn("event_ts_utc", F.col("event_ts_utc").cast("timestamp"))
+    result = result.withColumn("event_date_utc", F.to_date("event_ts_utc"))
+    result = result.withColumn("event_hour_utc", F.date_trunc("hour", F.col("event_ts_utc")))
+    result = result.withColumn(
+        "numeric_null_count",
+        _null_count_expr(HOURLY_NUMERIC_COLUMNS, "numeric_null_count"),
+    )
+
+    violation_terms = []
+    for name, (lower, upper) in RANGE_CHECKS.items():
+        if name not in result.columns:
+            continue
+        violation = F.lit(False)
+        if lower is not None:
+            violation = violation | (F.col(name) < F.lit(lower))
+        if upper is not None:
+            violation = violation | (F.col(name) > F.lit(upper))
+        flag_name = f"{name}_range_violation_flag"
+        result = result.withColumn(
+            flag_name,
+            F.when(violation, F.lit(True)).otherwise(F.lit(False)),
+        )
+        violation_terms.append(
+            F.when(F.col(flag_name), F.lit(1)).otherwise(F.lit(0))
+        )
+
+    if violation_terms:
+        violation_count = sum(violation_terms, F.lit(0)).cast("int")
+    else:
+        violation_count = F.lit(0).cast("int")
+    result = result.withColumn("range_violation_count", violation_count)
+    result = result.withColumn(
+        "data_quality_status",
+        F.when(F.col("range_violation_count") > 0, F.lit("review"))
+        .when(F.col("numeric_null_count") > 0, F.lit("partial"))
+        .otherwise(F.lit("complete")),
+    )
+    return result
+
+
+def aggregate_five_minute_to_hourly(inverter_silver: DataFrame) -> DataFrame:
+    """Aggregate telemetry by UTC hour and retain explicit coverage counts."""
+    _require_columns(
+        inverter_silver,
+        ["site_id", "event_ts_utc", "active_power_kw", "dc_input_power_kw",
+         "inverter_temp_c", "grid_freq_hz", "power_factor", "efficiency_pct"],
+        "Silver inverter telemetry",
+    )
+    keyed = inverter_silver.withColumn(
+        "event_hour_utc", F.date_trunc("hour", F.col("event_ts_utc"))
+    )
+    grouped = keyed.groupBy("site_id", "event_hour_utc").agg(
+        F.count(F.lit(1)).alias("raw_record_count"),
+        F.countDistinct("event_ts_utc").alias("raw_sample_count"),
+        F.count("active_power_kw").alias("active_power_sample_count"),
+        F.avg("active_power_kw").alias("five_minute_mean_active_power_kw"),
+        F.min("active_power_kw").alias("five_minute_min_active_power_kw"),
+        F.max("active_power_kw").alias("five_minute_max_active_power_kw"),
+        F.avg("dc_input_power_kw").alias("five_minute_mean_dc_input_power_kw"),
+        F.avg("inverter_temp_c").alias("five_minute_mean_inverter_temp_c"),
+        F.avg("grid_freq_hz").alias("five_minute_mean_grid_freq_hz"),
+        F.avg("power_factor").alias("five_minute_mean_power_factor"),
+        F.avg("efficiency_pct").alias("five_minute_mean_efficiency_pct"),
+    )
+    grouped = grouped.withColumn(
+        "duplicate_timestamp_count",
+        (F.col("raw_record_count") - F.col("raw_sample_count")).cast("long"),
+    )
+    grouped = grouped.withColumn(
+        "raw_data_coverage_pct",
+        F.round(F.least(F.col("raw_sample_count") / F.lit(12.0), F.lit(1.0)) * 100.0, 2),
+    )
+    grouped = grouped.withColumn(
+        "raw_coverage_status",
+        F.when(F.col("raw_sample_count") == 12, F.lit("complete_12"))
+        .when(F.col("raw_sample_count") < 12, F.lit("partial"))
+        .otherwise(F.lit("overfull")),
+    )
+    return grouped
+
+
+def build_silver_site_hourly_performance(
+    hourly_conditions: DataFrame,
+    raw_hourly: DataFrame,
+) -> DataFrame:
+    """Full-outer join hourly publisher records and five-minute-derived summaries.
+
+    The full outer join intentionally preserves raw telemetry hours even when
+    the publisher hourly file has no matching row, and publisher weather hours
+    with no five-minute source readings.
+    """
+    _require_columns(hourly_conditions, ["site_id", "event_ts_utc", *HOURLY_COLUMNS,
+                                        "range_violation_count", "data_quality_status"],
+                     "Silver hourly conditions")
+    _require_columns(raw_hourly, [
+        "site_id", "event_hour_utc", "raw_record_count", "raw_sample_count",
+        "active_power_sample_count", "five_minute_mean_active_power_kw",
+        "five_minute_min_active_power_kw", "five_minute_max_active_power_kw",
+        "five_minute_mean_dc_input_power_kw", "five_minute_mean_inverter_temp_c",
+        "five_minute_mean_grid_freq_hz", "five_minute_mean_power_factor",
+        "five_minute_mean_efficiency_pct", "duplicate_timestamp_count",
+        "raw_data_coverage_pct", "raw_coverage_status",
+    ], "Five-minute hourly aggregates")
+
+    h = hourly_conditions.alias("h")
+    r = raw_hourly.alias("r")
+    joined = h.join(
+        r,
+        (F.col("h.site_id") == F.col("r.site_id"))
+        & (F.col("h.event_ts_utc") == F.col("r.event_hour_utc")),
+        "full_outer",
+    )
+
+    weather_projection = [
+        F.col("h.datetime_utc").alias("publisher_datetime_utc"),
+        F.col("h.datetime_local").alias("publisher_datetime_local"),
+        F.col("h.active_power_kw").alias("publisher_hourly_active_power_kw"),
+        F.col("h.dc_input_power_kw").alias("publisher_hourly_dc_input_power_kw"),
+        F.col("h.daily_energy_kwh").alias("publisher_daily_energy_kwh"),
+        F.col("h.cumulative_energy_kwh").alias("publisher_cumulative_energy_kwh"),
+        F.col("h.inverter_temp_c").alias("publisher_hourly_inverter_temp_c"),
+        F.col("h.grid_freq_hz").alias("publisher_hourly_grid_freq_hz"),
+        F.col("h.power_factor").alias("publisher_hourly_power_factor"),
+        F.col("h.efficiency_pct").alias("publisher_hourly_efficiency_pct"),
+        F.col("h.inverter_status").alias("publisher_inverter_status"),
+        F.col("h.is_generating").alias("publisher_is_generating"),
+        *[
+            F.col(f"h.{name}").alias(f"weather_{name}")
+            for name in (
+                "temp_c", "humidity_pct", "cloud_cover_pct", "wind_speed_kmh",
+                "ghi_wm2", "dni_wm2", "dhi_wm2", "precip_mm",
+                "solar_elevation_deg", "solar_azimuth_deg", "capacity_factor",
+            )
+        ],
+        F.col("h.range_violation_count").alias("publisher_range_violation_count"),
+        F.col("h.data_quality_status").alias("publisher_data_quality_status"),
+        F.col("h.source_file").alias("publisher_source_file"),
+        F.col("h.source_relative_path").alias("publisher_source_relative_path"),
+        F.col("h.source_file_sha256").alias("publisher_source_file_sha256"),
+        F.col("h.record_hash").alias("publisher_record_hash"),
+        F.col("h.ingested_at_utc").alias("publisher_ingested_at_utc"),
+    ]
+    raw_projection = [
+        F.col(f"r.{name}") for name in (
+            "raw_record_count", "raw_sample_count", "active_power_sample_count",
+            "five_minute_mean_active_power_kw", "five_minute_min_active_power_kw",
+            "five_minute_max_active_power_kw", "five_minute_mean_dc_input_power_kw",
+            "five_minute_mean_inverter_temp_c", "five_minute_mean_grid_freq_hz",
+            "five_minute_mean_power_factor", "five_minute_mean_efficiency_pct",
+            "duplicate_timestamp_count", "raw_data_coverage_pct", "raw_coverage_status",
+        )
+    ]
+
+    result = joined.select(
+        F.coalesce(F.col("h.site_id"), F.col("r.site_id")).alias("site_id"),
+        F.coalesce(F.col("h.event_ts_utc"), F.col("r.event_hour_utc")).alias("event_hour_utc"),
+        *weather_projection,
+        *raw_projection,
+        F.col("h.event_ts_utc").isNotNull().alias("publisher_hour_present"),
+        F.col("r.event_hour_utc").isNotNull().alias("raw_telemetry_hour_present"),
+    )
+    result = result.withColumn("event_date_utc", F.to_date("event_hour_utc"))
+    result = result.withColumn(
+        "raw_sample_count", F.coalesce(F.col("raw_sample_count"), F.lit(0)).cast("long")
+    )
+    result = result.withColumn(
+        "raw_record_count", F.coalesce(F.col("raw_record_count"), F.lit(0)).cast("long")
+    )
+    result = result.withColumn(
+        "raw_coverage_status",
+        F.when(~F.col("raw_telemetry_hour_present"), F.lit("no_raw_data"))
+        .otherwise(F.col("raw_coverage_status")),
+    )
+
+    # Daylight context is derived from publisher weather/solar geometry. It is
+    # evidence for investigating a zero-power reading, not proof that the
+    # inverter must be generating.
+    daylight_context = (
+        (F.col("weather_solar_elevation_deg") > F.lit(DAYLIGHT_SOLAR_ELEVATION_THRESHOLD_DEG))
+        | (F.col("weather_ghi_wm2") >= F.lit(DAYLIGHT_GHI_THRESHOLD_WM2))
+    )
+    result = result.withColumn(
+        "daylight_context_flag",
+        F.when(daylight_context, F.lit(True)).otherwise(F.lit(False)),
+    )
+
+    operational_null_terms = [
+        F.when(F.col(name).isNull(), F.lit(1)).otherwise(F.lit(0))
+        for name in PUBLISHER_OPERATIONAL_FIELDS
+    ]
+    result = result.withColumn(
+        "publisher_operational_null_count",
+        sum(operational_null_terms, F.lit(0)).cast("int"),
+    )
+    result = result.withColumn(
+        "publisher_operational_fields_missing_flag",
+        F.when(
+            F.col("publisher_hour_present")
+            & F.col("daylight_context_flag")
+            & (F.col("publisher_operational_null_count") >= F.lit(6)),
+            F.lit(True),
+        ).otherwise(F.lit(False)),
+    )
+
+    # Flag a specific cross-source conflict when a complete 12-reading raw
+    # hour shows meaningful generation but the publisher reports exactly zero
+    # during daylight. Preserve both values and the absolute delta for audit.
+    result = result.withColumn(
+        "publisher_zero_conflict_with_raw_generation_flag",
+        F.when(
+            F.col("publisher_hour_present")
+            & F.col("raw_telemetry_hour_present")
+            & (F.col("raw_sample_count") == 12)
+            & (F.col("active_power_sample_count") == 12)
+            & (F.col("publisher_hourly_active_power_kw") == F.lit(0.0))
+            & (F.col("five_minute_mean_active_power_kw") > F.lit(RAW_GENERATION_CONFLICT_THRESHOLD_KW))
+            & F.col("daylight_context_flag"),
+            F.lit(True),
+        ).otherwise(F.lit(False)),
+    )
+    result = result.withColumn(
+        "active_power_comparison_eligible_flag",
+        F.when(
+            (F.col("raw_sample_count") == 12)
+            & (F.col("active_power_sample_count") == 12)
+            & F.col("publisher_hourly_active_power_kw").isNotNull()
+            & (~F.col("publisher_zero_conflict_with_raw_generation_flag")),
+            F.lit(True),
+        ).otherwise(F.lit(False)),
+    )
+    result = result.withColumn(
+        "active_power_mean_abs_delta_kw",
+        F.when(
+            (F.col("raw_sample_count") == 12)
+            & (F.col("active_power_sample_count") == 12)
+            & F.col("publisher_hourly_active_power_kw").isNotNull(),
+            F.abs(
+                F.col("publisher_hourly_active_power_kw")
+                - F.col("five_minute_mean_active_power_kw")
+            ),
+        ).otherwise(F.lit(None).cast("double")),
+    )
+    result = result.withColumn(
+        "hour_alignment_status",
+        F.when(~F.col("publisher_hour_present"), F.lit("missing_publisher_hour"))
+        .when(~F.col("raw_telemetry_hour_present"), F.lit("no_five_minute_source"))
+        .when(
+            F.col("publisher_zero_conflict_with_raw_generation_flag"),
+            F.lit("publisher_zero_conflicts_with_raw_generation"),
+        )
+        .when(
+            (F.col("raw_sample_count") == 12)
+            & (F.col("active_power_sample_count") == 12)
+            & F.col("publisher_hourly_active_power_kw").isNotNull(),
+            F.lit("comparable_complete_hour"),
+        )
+        .when(
+            (F.col("raw_sample_count") == 12)
+            & (F.col("active_power_sample_count") == 12)
+            & F.col("publisher_hourly_active_power_kw").isNull(),
+            F.lit("complete_raw_hour_missing_publisher_power"),
+        )
+        .when(
+            (F.col("raw_sample_count") == 12)
+            & (F.col("active_power_sample_count") < 12),
+            F.lit("complete_timestamps_missing_power"),
+        )
+        .when(F.col("raw_sample_count") > 12, F.lit("overfull_raw_hour"))
+        .otherwise(F.lit("partial_raw_hour")),
+    )
+    return result
+
+
+def assert_unique(frame: DataFrame, keys: list[str], label: str) -> None:
+    duplicates = (
+        frame.groupBy(*keys)
+        .count()
+        .filter(F.col("count") > 1)
+        .limit(1)
+        .count()
+    )
+    if duplicates:
+        raise ValueError(f"{label} contains duplicate business keys: {keys}")
+
+
+def write_delta_full_refresh(frame: DataFrame, path: Path) -> int:
+    """Replace a derived Silver snapshot; Bronze remains the immutable source."""
+    row_count = frame.count()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    (
+        frame.write.format("delta")
+        .mode("overwrite")
+        .option("overwriteSchema", "true")
+        .save(str(path))
+    )
+    return row_count
+
+
+def make_spark() -> SparkSession:
+    builder = (
+        SparkSession.builder
+        .appName("GridPulse-Silver-Transform")
+        .master("local[2]")
+        .config("spark.driver.host", "127.0.0.1")
+        .config("spark.driver.bindAddress", "127.0.0.1")
+        .config("spark.sql.session.timeZone", "UTC")
+        .config("spark.sql.shuffle.partitions", "4")
+        .config("spark.default.parallelism", "2")
+        .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
+        .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog")
+        .config("spark.databricks.delta.schema.autoMerge.enabled", "false")
+    )
+    return configure_spark_with_delta_pip(builder).getOrCreate()
+
+
+def main() -> int:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    log = logging.getLogger("gridpulse.silver")
+
+    for source_path in (BRONZE_INVERTER, BRONZE_HOURLY):
+        if not (source_path / "_delta_log").is_dir():
+            log.error("Required Bronze Delta table not found: %s", source_path)
+            return 2
+
+    spark = make_spark()
+    try:
+        bronze_inverter = spark.read.format("delta").load(str(BRONZE_INVERTER))
+        bronze_hourly = spark.read.format("delta").load(str(BRONZE_HOURLY))
+
+        assert_unique(
+            bronze_inverter,
+            ["site_id", "device_name", "event_ts_utc"],
+            "Bronze inverter telemetry",
+        )
+        assert_unique(bronze_hourly, ["site_id", "event_ts_utc"], "Bronze hourly data")
+
+        log.info("Building Silver five-minute inverter telemetry")
+        silver_inverter = build_silver_inverter(bronze_inverter)
+        log.info("Building Silver hourly site conditions")
+        silver_hourly = build_silver_hourly_conditions(bronze_hourly)
+        log.info("Aggregating five-minute readings to UTC hours")
+        raw_hourly = aggregate_five_minute_to_hourly(silver_inverter)
+        log.info("Joining hourly conditions and telemetry coverage")
+        silver_performance = build_silver_site_hourly_performance(silver_hourly, raw_hourly)
+
+        assert_unique(
+            silver_inverter,
+            ["site_id", "device_name", "event_ts_utc"],
+            "Silver inverter telemetry",
+        )
+        assert_unique(silver_hourly, ["site_id", "event_ts_utc"], "Silver hourly conditions")
+        assert_unique(silver_performance, ["site_id", "event_hour_utc"], "Silver hourly performance")
+
+        counts = {
+            "silver_inverter_telemetry_5m": write_delta_full_refresh(silver_inverter, SILVER_INVERTER),
+            "silver_site_hourly_conditions": write_delta_full_refresh(silver_hourly, SILVER_HOURLY),
+            "silver_site_hourly_performance": write_delta_full_refresh(silver_performance, SILVER_PERFORMANCE),
+        }
+        for table_name, count in counts.items():
+            log.info("%s: %s rows", table_name, f"{count:,}")
+
+        log.info("Hourly raw coverage distribution:")
+        (
+            silver_performance.groupBy("raw_coverage_status")
+            .count()
+            .orderBy("raw_coverage_status")
+            .show(truncate=False)
+        )
+        log.info("Hourly alignment distribution:")
+        (
+            silver_performance.groupBy("hour_alignment_status")
+            .count()
+            .orderBy("hour_alignment_status")
+            .show(truncate=False)
+        )
+        log.info("Publisher zero-vs-generation conflict hours:")
+        (
+            silver_performance
+            .filter(F.col("publisher_zero_conflict_with_raw_generation_flag"))
+            .groupBy("site_id")
+            .count()
+            .orderBy("site_id")
+            .show(truncate=False)
+        )
+        log.info("Publisher daylight operational-field gaps:")
+        (
+            silver_performance
+            .filter(F.col("publisher_operational_fields_missing_flag"))
+            .groupBy("site_id")
+            .count()
+            .orderBy("site_id")
+            .show(truncate=False)
+        )
+        log.info("Silver transformation completed successfully.")
+        return 0
+    finally:
+        spark.stop()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
